@@ -4,3 +4,6 @@ log*/
 .vscode/
 unimal*
 test*
+
+output
+*.egg-info

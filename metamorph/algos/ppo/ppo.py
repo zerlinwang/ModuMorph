@@ -106,6 +106,18 @@ class PPO:
             lr = ou.get_iter_lr(cur_iter)
             ou.set_lr(self.optimizer, lr, self.lr_scale)
 
+            HI = {}
+            T, P = cfg.PPO.TIMESTEPS, cfg.PPO.NUM_ENVS
+            K, N, C = cfg.HI.MAX_LENGTH, cfg.MODEL.MAX_LIMBS, cfg.MODEL.LIMB_EMBED_SIZE
+            HI["hi_encoded_feature"] = [torch.zeros((P, N, C), device=self.device) for _ in range(K)]
+            HI["hi_act"] = [torch.zeros((P, self.envs.action_space.shape[0]), device=self.device) for _ in range(K)]
+            HI["hi_masks"] = [torch.zeros((P, 1), device=self.device) for _ in range(K)]
+
+            hi_encoded_feature = torch.stack(HI["hi_encoded_feature"], dim=1)
+            hi_act = torch.stack(HI["hi_act"], dim=1)
+            hi_masks = torch.stack(HI["hi_masks"], dim=1)
+
+            last_done = [[False] for _ in range(P)]
 
             for step in range(cfg.PPO.TIMESTEPS):
                 # get the id of each robot if needed
@@ -113,10 +125,15 @@ class PPO:
                     unimal_ids = self.envs.get_unimal_idx()
                 else:
                     unimal_ids = [0 for _ in range(cfg.PPO.NUM_ENVS)]
+
                 # Sample actions
-                val, act, logp, dropout_mask_v, dropout_mask_mu = self.agent.act(obs, unimal_ids=unimal_ids)
+                val, act, logp, dropout_mask_v, dropout_mask_mu, encoded_feature = self.agent.act(obs, \
+                        hi_encoded_feature, hi_act, hi_masks, unimal_ids=unimal_ids)
+
 
                 next_obs, reward, done, infos = self.envs.step(act)
+
+                last_done = done
 
                 self.train_meter.add_ep_info(infos)
 
@@ -131,8 +148,25 @@ class PPO:
                     device=self.device,
                 )
 
-                self.buffer.insert(obs, act, logp, val, reward, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids)
+                self.buffer.insert(obs, act, logp, val, reward, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids, encoded_feature)
                 obs = next_obs
+
+                # update HI
+                HI["hi_encoded_feature"].pop(0)
+                HI["hi_encoded_feature"].append(encoded_feature)
+                HI["hi_act"].pop(0)
+                HI["hi_act"].append(act)
+                HI["hi_masks"].pop(0)
+                HI["hi_masks"].append(torch.ones((T, P, 1), dtype=torch.float, device=self.device))
+
+                for p, done_info in enumerate(last_done):
+                    if done_info:
+                        for himask in HI["hi_masks"]:
+                            himask[p] = 0.
+
+                hi_encoded_feature = torch.stack(HI["hi_encoded_feature"], dim=1)
+                hi_act = torch.stack(HI["hi_act"], dim=1)
+                hi_masks = torch.stack(HI["hi_masks"], dim=1)
 
             if cfg.MODEL.TRANSFORMER.PER_NODE_EMBED:
                 unimal_ids = self.envs.get_unimal_idx()
@@ -181,7 +215,9 @@ class PPO:
 
             for j, batch in enumerate(batch_sampler):
                 # Reshape to do in a single forward pass for all steps
-                val, _, logp, ent, _, _ = self.actor_critic(batch["obs"], batch["act"], \
+                val, _, logp, ent, _, _ = self.actor_critic(batch["obs"], \
+                    batch["hi_encoded_feature"], batch['hi_act'], \
+                    batch['hi_masks'], batch["act"], \
                     dropout_mask_v=batch['dropout_mask_v'], \
                     dropout_mask_mu=batch['dropout_mask_mu'], \
                     unimal_ids=batch['unimal_ids'])

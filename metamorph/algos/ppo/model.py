@@ -77,6 +77,8 @@ class TransformerModel(nn.Module):
             self.limb_embed = nn.Linear(limb_obs_size, self.d_model)
         self.ext_feat_fusion = self.model_args.EXT_MIX
 
+        self.tt = TemporalTransformer(self.d_model, 2)
+
         if self.model_args.POS_EMBEDDING == "learnt":
             print ('use PE learnt')
             seq_len = self.seq_len
@@ -87,7 +89,7 @@ class TransformerModel(nn.Module):
 
         # Transformer Encoder
         encoder_layers = TransformerEncoderLayerResidual(
-            cfg.MODEL.LIMB_EMBED_SIZE,
+            cfg.MODEL.LIMB_EMBED_SIZE * 2,  # 128 * 2 = 256
             self.model_args.NHEAD,
             self.model_args.DIM_FEEDFORWARD,
             self.model_args.DROPOUT,
@@ -98,7 +100,7 @@ class TransformerModel(nn.Module):
         )
 
         # Map encoded observations to per node action mu or critic value
-        decoder_input_dim = self.d_model
+        decoder_input_dim = self.d_model * 2
 
         # Task based observation encoder
         if "hfield" in cfg.ENV.KEYS_TO_KEEP:
@@ -240,9 +242,12 @@ class TransformerModel(nn.Module):
                 self.hnet_decoder_bias[i].weight.data.zero_()
                 self.hnet_decoder_bias[i].bias.data.zero_()
 
-    def forward(self, obs, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, return_attention=False, dropout_mask=None, unimal_ids=None):
+    def forward(self, obs, hi_encoded_feature, hi_act, hi_masks, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, return_attention=False, dropout_mask=None, unimal_ids=None):
         # (num_limbs, batch_size, limb_obs_size) -> (num_limbs, batch_size, d_model)
         _, batch_size, limb_obs_size = obs.shape
+
+        hi_act = hi_act.reshape(batch_size, cfg.HI.MAX_LENGTH, hi_act.shape[-1] // 2, 2)    # [N]
+        morph_context, dynamic_context = self.tt(hi_encoded_feature, hi_act, hi_masks)
 
         if "hfield" in cfg.ENV.KEYS_TO_KEEP:
             # (batch_size, embed_size)
@@ -282,6 +287,9 @@ class TransformerModel(nn.Module):
                 obs_embed = (obs[:, :, :, None] * self.limb_embed_weights[:, unimal_ids, :, :]).sum(dim=-2, keepdim=False) + self.limb_embed_bias[:, unimal_ids, :]
             else:
                 obs_embed = self.limb_embed(obs)    # [N, B, obs_dim52] -> [N, B, h_dim128]
+
+        # concate morph context
+        obs_embed = torch.cat([obs_embed, morph_context], axis=-1)
         
         if self.model_args.EMBEDDING_SCALE:
             obs_embed *= math.sqrt(self.d_model)
@@ -340,8 +348,11 @@ class TransformerModel(nn.Module):
                 context=context_to_base, 
                 morphology_info=morphology_info
             )
+
+        encoded_feature = obs_embed_t.detach().clone().permute(1, 0, 2)
         
         decoder_input = obs_embed_t # [N, B, 128] as the dims of output and input of transformer model are the same
+        decoder_input = torch.cat([obs_embed_t, dynamic_context], dim=-1)
         if "hfield" in cfg.ENV.KEYS_TO_KEEP and self.ext_feat_fusion == "late":
             decoder_input = torch.cat([decoder_input, hfield_obs], axis=2)
 
@@ -366,7 +377,7 @@ class TransformerModel(nn.Module):
         # (batch_size, num_limbs * J)
         output = output.reshape(batch_size, -1)
 
-        return output, attention_maps, dropout_mask
+        return output, attention_maps, dropout_mask, encoded_feature
 
 
 class PositionalEncoding(nn.Module):
@@ -461,7 +472,7 @@ class ActorCritic(nn.Module):
         else:
             self.log_std = nn.Parameter(torch.zeros(1, self.num_actions))
 
-    def forward(self, obs, act=None, return_attention=False, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None, compute_val=True):
+    def forward(self, obs, hi_encoded_feature, hi_act, hi_masks, act=None, return_attention=False, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None, compute_val=True):
                 
         if act is not None:
             batch_size = cfg.PPO.BATCH_SIZE
@@ -504,8 +515,8 @@ class ActorCritic(nn.Module):
         # do not need to compute value function during evaluation to save time
         if compute_val:
             # Per limb critic values
-            limb_vals, v_attention_maps, dropout_mask_v = self.v_net(
-                obs, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, 
+            limb_vals, v_attention_maps, dropout_mask_v, _ = self.v_net(
+                obs, hi_encoded_feature, hi_act, hi_masks, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, 
                 return_attention=return_attention, dropout_mask=dropout_mask_v, 
                 unimal_ids=unimal_ids, 
             )
@@ -517,8 +528,8 @@ class ActorCritic(nn.Module):
         else:
             val, v_attention_maps, dropout_mask_v = 0., None, 0.
 
-        mu, mu_attention_maps, dropout_mask_mu = self.mu_net(   # FT [B, N*2]
-            obs, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, 
+        mu, mu_attention_maps, dropout_mask_mu, encoded_feature = self.mu_net(   # FT [B, N*2]
+            obs, hi_encoded_feature, hi_act, hi_masks, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, 
             return_attention=return_attention, dropout_mask=dropout_mask_mu, 
             unimal_ids=unimal_ids, 
         )
@@ -533,12 +544,12 @@ class ActorCritic(nn.Module):
             entropy = pi.entropy()
             entropy[act_mask] = 0.0
             entropy = entropy.mean()
-            return val, pi, logp, entropy, dropout_mask_v, dropout_mask_mu  # [B, 1], _, [B, N*2], [B, 1], 0.0, 0.0
+            return val, pi, logp, entropy, dropout_mask_v, dropout_mask_mu, encoded_feature  # [B, 1], _, [B, N*2], [B, 1], 0.0, 0.0, [B, N, 128]
         else:
             if return_attention:
                 return val, pi, v_attention_maps, mu_attention_maps, dropout_mask_v, dropout_mask_mu
             else:
-                return val, pi, None, None, dropout_mask_v, dropout_mask_mu
+                return val, pi, None, None, dropout_mask_v, dropout_mask_mu, encoded_feature
 
 
 class Agent:
@@ -546,8 +557,8 @@ class Agent:
         self.ac = actor_critic
 
     @torch.no_grad()
-    def act(self, obs, return_attention=False, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None, compute_val=True):
-        val, pi, v_attention_maps, mu_attention_maps, dropout_mask_v, dropout_mask_mu = self.ac(obs, return_attention=return_attention, dropout_mask_v=dropout_mask_v, dropout_mask_mu=dropout_mask_mu, unimal_ids=unimal_ids, compute_val=compute_val)
+    def act(self, obs, hi_encoded_feature, hi_act, hi_masks, return_attention=False, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None, compute_val=True):
+        val, pi, v_attention_maps, mu_attention_maps, dropout_mask_v, dropout_mask_mu, encoded_feature = self.ac(obs, hi_encoded_feature, hi_act, hi_masks, return_attention=return_attention, dropout_mask_v=dropout_mask_v, dropout_mask_mu=dropout_mask_mu, unimal_ids=unimal_ids, compute_val=compute_val)
         self.pi = pi
         if not cfg.DETERMINISTIC:
             act = pi.sample()
@@ -559,11 +570,11 @@ class Agent:
         logp = logp.sum(-1, keepdim=True)
         self.v_attention_maps = v_attention_maps
         self.mu_attention_maps = mu_attention_maps
-        return val, act, logp, dropout_mask_v, dropout_mask_mu
+        return val, act, logp, dropout_mask_v, dropout_mask_mu, encoded_feature
 
     @torch.no_grad()
     def get_value(self, obs, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None):
-        val, _, _, _, _, _ = self.ac(obs, dropout_mask_v=dropout_mask_v, dropout_mask_mu=dropout_mask_mu, unimal_ids=unimal_ids)
+        val, _, _, _, _, _, _ = self.ac(obs, dropout_mask_v=dropout_mask_v, dropout_mask_mu=dropout_mask_mu, unimal_ids=unimal_ids)
         return val
 
 
@@ -572,14 +583,14 @@ class TemporalTransformer(nn.Module):
     Transformer to predict Morphology context and Dynamics context based on historial context emb and act
     """
 
-    def __init__(self, context_emb_dim, act_dim) -> None:
+    def __init__(self, encoded_feature_dim, act_dim) -> None:
         super().__init__()
         self.h_dim = cfg.TT.HDIM
         self.context_len = cfg.HI.MAX_LENGTH
         # embedding layer
         self.timestep_embed = nn.Embedding(self.context_len, self.h_dim)
         self.act_embed = nn.Linear(act_dim, self.h_dim)
-        self.obs_embed = nn.Linear(context_emb_dim, self.h_dim)
+        self.obs_embed = nn.Linear(encoded_feature_dim, self.h_dim)
         # transformer layer
         blocks = TransformerEncoderLayerResidual(
             self.h_dim,
@@ -612,29 +623,29 @@ class TemporalTransformer(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, hi_context_emb: torch.Tensor, hi_act: torch.Tensor, hi_masks: torch.Tensor):
+    def forward(self, hi_encoded_feature: torch.Tensor, hi_act: torch.Tensor, hi_masks: torch.Tensor):
         """
         Compute contexts based on history info
         We don't care about the obs mask because all limbs share the same network
         Input:
-            hi_context_emb: torch.Tensor (B, K, N, context_emb_dim)
+            hi_encoded_feature: torch.Tensor (B, K, N, encoded_feature_dim)
             hi_act: torch.Tensor (B, K, N, act_dim)
             hi_masks: torch.Tensor (B, K, N, 1)
         Return:
             morph_context: torch.Tensor (N, B, morph_context_dim), context to be concatenated with obs embedding indicating the morphology
             dynamic_context: torch.Tensor (N, B, dynamic_context_dim), context to be concatenated with decoder input indicating the dynamic of MDP
         """
-        B, K, N = hi_context_emb.shape[:-1]
+        B, K, N = hi_encoded_feature.shape[:-1]
         assert K == self.context_len, "K should be equal to context length"
 
         # permute to fit with PyTorch Network settings
-        hi_context_emb = hi_context_emb.permute(2, 0, 1, 3)   # (N, B, K(length), context_emb_dim)
+        hi_encoded_feature = hi_encoded_feature.permute(2, 0, 1, 3)   # (N, B, K(length), encoded_feature_dim)
         hi_act = hi_act.permute(2, 0, 1, 3)
         hi_masks = hi_masks.permute(2, 0, 1, 3).reshape(N*B, K, 1).repeat(1, 1, 2).reshape(N*B, 2*K)    # 2*K because of two modalities
 
         # embedding
         timestep_embedding = self.timestep_embed(self.timestep) # -> (1, K, h_dim)
-        obs_embedding = self.obs_embed(hi_context_emb) + timestep_embedding   # -> (N, B, K, h_dim)
+        obs_embedding = self.obs_embed(hi_encoded_feature) + timestep_embedding   # -> (N, B, K, h_dim)
         act_embedding = self.act_embed(hi_act) + timestep_embedding  # -> (N, B, K, h_dim)
 
         # stack -> (N*B, 2*K, h_dim)
@@ -666,10 +677,10 @@ if __name__ == "__main__":
     cfg.merge_from_file(args.cfg_file)
     cfg.merge_from_list(args.opts)
 
-    hi_context_emb, act_dim = 128, 2
+    hi_encoded_feature, act_dim = 128, 2
 
     # model initialization
-    tt = TemporalTransformer(hi_context_emb, act_dim)
+    tt = TemporalTransformer(hi_encoded_feature, act_dim)
     pprint(tt)
 
     if torch.cuda.is_available():
@@ -680,12 +691,12 @@ if __name__ == "__main__":
 
     # fake data manufication
     B, K, N = 32, 16, 12
-    hi_context_emb = torch.randn((B, K, N, hi_context_emb)).cuda()
+    hi_encoded_feature = torch.randn((B, K, N, hi_encoded_feature)).cuda()
     hi_act = torch.randn((B, K, N, act_dim)).cuda()
-    hi_masks = torch.randint(0, 2, (B, K, N, 1)).to(torch.bool).cuda()
+    hi_masks = torch.randint(0, 2, (B, K, N, 1)).to(torch.float).cuda()
 
     # forward
-    morph_context, dynamic_context = tt(hi_context_emb, hi_act, hi_masks)
+    morph_context, dynamic_context = tt(hi_encoded_feature, hi_act, hi_masks)
 
     pprint(morph_context.shape)
     pprint(dynamic_context.shape)

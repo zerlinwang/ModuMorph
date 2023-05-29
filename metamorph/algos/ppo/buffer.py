@@ -12,9 +12,11 @@ class Buffer(object):
         T, P = cfg.PPO.TIMESTEPS, cfg.PPO.NUM_ENVS
 
         # Temporal history info length
-        K, C = cfg.HI.MAX_LENGTH, cfg.MODEL.TRANSFORMER.CONTEXT_EMBED_SIZE
-        self.context_embed = torch.zeros(T, P, C)
-        self.hi_context_embed = torch.zeros(T, K, P, C)
+        K, N, C = cfg.HI.MAX_LENGTH, cfg.MODEL.MAX_LIMBS, cfg.MODEL.LIMB_EMBED_SIZE
+        self.encoded_feature = torch.zeros(T, P, N, C)
+        self.hi_encoded_feature = torch.zeros(T, P, K, N, C)
+        
+        self.act_shape = act_shape
 
         if isinstance(obs_space, gym.spaces.Dict):
             self.obs = {}
@@ -25,7 +27,7 @@ class Buffer(object):
             self.hi_obs = torch.zeros(T, P, *obs_space.shape)
 
         self.act = torch.zeros(T, P, *act_shape)
-        self.hi_act = torch.zeros(T, K, P, *act_shape)
+        self.hi_act = torch.zeros(T, P, K, *act_shape)
         self.val = torch.zeros(T, P, 1)
         self.rew = torch.zeros(T, P, 1)
         self.ret = torch.zeros(T, P, 1)
@@ -37,13 +39,13 @@ class Buffer(object):
         self.unimal_ids = torch.zeros(T, P).long()
 
         # indicate no-exist history (1. means exists)
-        self.hi_masks = torch.ones(T, K, P, 1)
+        self.hi_masks = torch.ones((T, P, K, 1), dtype=torch.float)
 
         self.step = 0
 
     def to(self, device):
-        self.context_embed = self.context_embed.to(device)
-        self.hi_context_embed = self.hi_context_embed.to(device)
+        self.encoded_feature = self.encoded_feature.to(device)
+        self.hi_encoded_feature = self.hi_encoded_feature.to(device)
         if isinstance(self.obs, dict):
             for obs_type, obs_space in self.obs.items():
                 self.obs[obs_type] = self.obs[obs_type].to(device)
@@ -62,47 +64,56 @@ class Buffer(object):
         self.unimal_ids = self.unimal_ids.to(device)
         self.hi_masks = self.hi_masks.to(device)
 
-    def insert(self, obs, act, logp, val, rew, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids):
+    def insert(self, obs, act, logp, val, rew, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids, encoded_feature):
         if isinstance(obs, dict):
             for obs_type, obs_val in obs.items():
                 self.obs[obs_type][self.step] = obs_val
         else:
             self.obs[self.step] = obs
-        self.act[self.step] = act   # [B, 24]
-        self.val[self.step] = val   # [B, 1]
-        self.rew[self.step] = rew   # [B, 1]
-        self.logp[self.step] = logp # [B, 1]
-        self.masks[self.step] = masks   # [B, 1] done env
-        self.timeout[self.step] = timeouts  # [B, 1] timeouts env
+        self.act[self.step] = act   # [P, 24]
+        self.val[self.step] = val   # [P, 1]
+        self.rew[self.step] = rew   # [P, 1]
+        self.logp[self.step] = logp # [P, 1]
+        self.masks[self.step] = masks   # [P, 1] done env
+        self.timeout[self.step] = timeouts  # [P, 1] timeouts env
         self.dropout_mask_v[self.step] = dropout_mask_v # float 0.0
         self.dropout_mask_mu[self.step] = dropout_mask_mu   # float 0.0
         self.unimal_ids[self.step] = torch.LongTensor(unimal_ids)   # list of length B
+        self.encoded_feature[self.step] = encoded_feature   # [P, N, encoded_feature_dim]
 
         self.step = (self.step + 1) % cfg.PPO.TIMESTEPS
 
     def set_history_info(self):
         """
         History informations, i.e., the lastest $K$-steps obs and acts are recorded in buffer considering the masks and timeout
-        self.context_embed: torch.Tensors with shape of [T, P, C]
-        self.hi_context_embed: dict of torch.Tensors with shape of [T, K, P, C]
+        self.encoded_feature: torch.Tensors with shape of [T, P, N, C]
+        self.hi_encoded_feature: dict of torch.Tensors with shape of [T, P, K, N, C]
         self.act: torch.Tensor with shape of [T, P, *act_shape]
-        self.hi_act: torch.Tensor with shape of [T, K, P, *act_shape]
+        self.hi_act: torch.Tensor with shape of [T, P, K, *act_shape]
         self.masks: torch.Tensor with shape of [T, P, 1], denotes the timesteps where agent died or timeout (where mask = 0.)
-        self.hi_masks: torch.Tensor with shape of [T, K, P, 1], denotes the timesteps where is no history infos (where hi_mask = 0.)
+        self.hi_masks: torch.Tensor with shape of [T, P, K, 1], denotes the timesteps where is no history infos (where hi_mask = 0.)
         """
-        T, K = self.hi_context_embed.shape[:1]
+        T, P, K = self.hi_encoded_feature.shape[:2]
         for t in range(T):
-            # hi_context_embed
-            self.hi_context_embed[t] = torch.stack(self.context_embed[t-K: t], dim=0)
-            # hi_act
-            self.hi_act[t] = torch.stack(self.act[t-K:t], dim=0)
+            if t < K:
+                # hi_encoded_feature
+                self.hi_encoded_feature[t, :, -t-1:] = torch.stack(self.encoded_feature[:t+1], dim=1)
+                # hi_act
+                self.hi_act[t, :, -t-1:] = torch.stack(self.act[:t+1], dim=1)
+            else:
+                # hi_encoded_feature
+                self.hi_encoded_feature[t] = torch.stack(self.encoded_feature[t-K:t], dim=1)
+                # hi_act
+                self.hi_act[t] = torch.stack(self.act[t-K:t], dim=1)
             # hi_masks
             for k in range(K):
                 if k > t:
                     break
-                elif self.masks[t-k] == 0.:
-                    self.hi_masks[t][:-k] == 0.
-                    break
+            else:
+                for p in range(P):
+                    if self.masks[t-k, p] == 0.:
+                        self.hi_masks[t, p, :-k] = 0.
+                break
 
     def compute_returns(self, next_value):
         """
@@ -155,4 +166,7 @@ class Buffer(object):
             batch["dropout_mask_v"] = self.dropout_mask_v.view(-1, 12, 128)[idxs]
             batch["dropout_mask_mu"] = self.dropout_mask_mu.view(-1, 12, 128)[idxs]
             batch["unimal_ids"] = self.unimal_ids.view(-1)[idxs]
+            batch['hi_encoded_feature'] = self.hi_encoded_feature.view(-1, cfg.HI.MAX_LENGTH, cfg.MODEL.MAX_LIMBS, cfg.MODEL.LIMB_EMBED_SIZE)[idxs]
+            batch['hi_act'] = self.hi_act.view(-1, cfg.HI.MAX_LENGTH, self.act.size(-1))[idxs] # (24)
+            batch['hi_masks'] = self.hi_masks.view(-1, cfg.HI.MAX_LENGTH, 1)[idxs]
             yield batch

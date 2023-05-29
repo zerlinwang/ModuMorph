@@ -142,6 +142,7 @@ class PPO:
             # Refer to the paper "Time Limits in Reinforcement Learning"
             next_val = self.agent.get_value(obs, unimal_ids=unimal_ids)
             self.buffer.compute_returns(next_val)
+            self.buffer.set_history_info()
             self.train_on_batch(cur_iter)
             self.save_sampled_agent_seq(cur_iter)
 

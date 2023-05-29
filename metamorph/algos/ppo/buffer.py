@@ -11,14 +11,21 @@ class Buffer(object):
     def __init__(self, obs_space, act_shape):
         T, P = cfg.PPO.TIMESTEPS, cfg.PPO.NUM_ENVS
 
+        # Temporal history info length
+        K, C = cfg.HI.MAX_LENGTH, cfg.MODEL.TRANSFORMER.CONTEXT_EMBED_SIZE
+        self.context_embed = torch.zeros(T, P, C)
+        self.hi_context_embed = torch.zeros(T, K, P, C)
+
         if isinstance(obs_space, gym.spaces.Dict):
             self.obs = {}
             for obs_type, obs_space_ in obs_space.spaces.items():
                 self.obs[obs_type] = torch.zeros(T, P, *obs_space_.shape)
         else:
             self.obs = torch.zeros(T, P, *obs_space.shape)
+            self.hi_obs = torch.zeros(T, P, *obs_space.shape)
 
         self.act = torch.zeros(T, P, *act_shape)
+        self.hi_act = torch.zeros(T, K, P, *act_shape)
         self.val = torch.zeros(T, P, 1)
         self.rew = torch.zeros(T, P, 1)
         self.ret = torch.zeros(T, P, 1)
@@ -29,15 +36,21 @@ class Buffer(object):
         self.dropout_mask_mu = torch.ones(T, P, 12, 128)
         self.unimal_ids = torch.zeros(T, P).long()
 
+        # indicate no-exist history (1. means exists)
+        self.hi_masks = torch.ones(T, K, P, 1)
+
         self.step = 0
 
     def to(self, device):
+        self.context_embed = self.context_embed.to(device)
+        self.hi_context_embed = self.hi_context_embed.to(device)
         if isinstance(self.obs, dict):
             for obs_type, obs_space in self.obs.items():
                 self.obs[obs_type] = self.obs[obs_type].to(device)
         else:
             self.obs = self.obs.to(device)
         self.act = self.act.to(device)
+        self.hi_act = self.hi_act.to(device)
         self.val = self.val.to(device)
         self.rew = self.rew.to(device)
         self.ret = self.ret.to(device)
@@ -47,6 +60,7 @@ class Buffer(object):
         self.dropout_mask_v = self.dropout_mask_v.to(device)
         self.dropout_mask_mu = self.dropout_mask_mu.to(device)
         self.unimal_ids = self.unimal_ids.to(device)
+        self.hi_masks = self.hi_masks.to(device)
 
     def insert(self, obs, act, logp, val, rew, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids, limb_logp):
         if isinstance(obs, dict):
@@ -65,6 +79,30 @@ class Buffer(object):
         self.unimal_ids[self.step] = torch.LongTensor(unimal_ids)   # list of length B
 
         self.step = (self.step + 1) % cfg.PPO.TIMESTEPS
+
+    def set_history_info(self):
+        """
+        History informations, i.e., the lastest $K$-steps obs and acts are recorded in buffer considering the masks and timeout
+        self.context_embed: torch.Tensors with shape of [T, P, C]
+        self.hi_context_embed: dict of torch.Tensors with shape of [T, K, P, C]
+        self.act: torch.Tensor with shape of [T, P, *act_shape]
+        self.hi_act: torch.Tensor with shape of [T, K, P, *act_shape]
+        self.masks: torch.Tensor with shape of [T, P, 1], denotes the timesteps where agent died or timeout (where mask = 0.)
+        self.hi_masks: torch.Tensor with shape of [T, K, P, 1], denotes the timesteps where is no history infos (where hi_mask = 0.)
+        """
+        T, K = self.hi_context_embed.shape[:1]
+        for t in range(T):
+            # hi_context_embed
+            self.hi_context_embed[t] = torch.stack(self.context_embed[t-K: t], dim=0)
+            # hi_act
+            self.hi_act[t] = torch.stack(self.act[t-K:t], dim=0)
+            # hi_masks
+            for k in range(K):
+                if k > t:
+                    break
+                elif self.masks[t-k] == 0.:
+                    self.hi_masks[t][:-k] == 0.
+                    break
 
     def compute_returns(self, next_value):
         """

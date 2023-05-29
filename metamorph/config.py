@@ -560,6 +560,15 @@ _C.EXIT_ON_MJ_STEP_EXCEPTION = False
 
 _C.MIRROR_DATA_AUG = False
 
+# ----------------------------------------------------------------------------#
+# History information conditions settings
+# ----------------------------------------------------------------------------#
+_C.HI = CN()
+
+# Max length of history
+_C.HI.MAX_LENGTH = 16
+
+
 def dump_cfg(cfg_name=None):
     """Dumps the config to the output directory."""
     if not cfg_name:

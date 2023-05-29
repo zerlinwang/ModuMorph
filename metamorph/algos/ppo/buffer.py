@@ -62,7 +62,7 @@ class Buffer(object):
         self.unimal_ids = self.unimal_ids.to(device)
         self.hi_masks = self.hi_masks.to(device)
 
-    def insert(self, obs, act, logp, val, rew, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids, limb_logp):
+    def insert(self, obs, act, logp, val, rew, masks, timeouts, dropout_mask_v, dropout_mask_mu, unimal_ids):
         if isinstance(obs, dict):
             for obs_type, obs_val in obs.items():
                 self.obs[obs_type][self.step] = obs_val

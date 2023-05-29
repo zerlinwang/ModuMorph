@@ -54,15 +54,15 @@ class Buffer(object):
                 self.obs[obs_type][self.step] = obs_val
         else:
             self.obs[self.step] = obs
-        self.act[self.step] = act
-        self.val[self.step] = val
-        self.rew[self.step] = rew
-        self.logp[self.step] = logp
-        self.masks[self.step] = masks
-        self.timeout[self.step] = timeouts
-        self.dropout_mask_v[self.step] = dropout_mask_v
-        self.dropout_mask_mu[self.step] = dropout_mask_mu
-        self.unimal_ids[self.step] = torch.LongTensor(unimal_ids)
+        self.act[self.step] = act   # [B, 24]
+        self.val[self.step] = val   # [B, 1]
+        self.rew[self.step] = rew   # [B, 1]
+        self.logp[self.step] = logp # [B, 1]
+        self.masks[self.step] = masks   # [B, 1] done env
+        self.timeout[self.step] = timeouts  # [B, 1] timeouts env
+        self.dropout_mask_v[self.step] = dropout_mask_v # float 0.0
+        self.dropout_mask_mu[self.step] = dropout_mask_mu   # float 0.0
+        self.unimal_ids[self.step] = torch.LongTensor(unimal_ids)   # list of length B
 
         self.step = (self.step + 1) % cfg.PPO.TIMESTEPS
 

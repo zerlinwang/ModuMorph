@@ -22,11 +22,11 @@ class MLPModel(nn.Module):
     def __init__(self, obs_space, out_dim):
         super(MLPModel, self).__init__()
         self.model_args = cfg.MODEL.MLP
-        self.seq_len = cfg.MODEL.MAX_LIMBS
+        self.seq_len = cfg.MODEL.MAX_LIMBS  # FT 12
         self.limb_obs_size = limb_obs_size = obs_space["proprioceptive"].shape[0] // self.seq_len
         self.limb_out_dim = out_dim // self.seq_len
 
-        self.input_layer = nn.Linear(obs_space["proprioceptive"].shape[0], self.model_args.HIDDEN_DIM)
+        self.input_layer = nn.Linear(obs_space["proprioceptive"].shape[0], self.model_args.HIDDEN_DIM)  # FT 624 // 12 = 52
 
         self.output_layer = nn.Linear(self.model_args.HIDDEN_DIM, out_dim)
         
@@ -106,7 +106,7 @@ class TransformerModel(nn.Module):
 
         if self.ext_feat_fusion == "late":
             decoder_input_dim += self.hfield_encoder.obs_feat_dim
-        self.decoder_input_dim = decoder_input_dim
+        self.decoder_input_dim = decoder_input_dim  # Dim of output of each transformer block, 128
 
         if self.model_args.PER_NODE_DECODER:
             # only support a single output layer
@@ -119,7 +119,7 @@ class TransformerModel(nn.Module):
             self.decoder_bias = nn.Parameter(self.decoder_bias)
         else:
             self.decoder = tu.make_mlp_default(
-                [decoder_input_dim] + self.model_args.DECODER_DIMS + [decoder_out_dim],
+                [decoder_input_dim] + self.model_args.DECODER_DIMS + [decoder_out_dim], # FT [128, 1 (v_net) / 2 (pi)]
                 final_nonlinearity=False,
             )
 
@@ -281,7 +281,7 @@ class TransformerModel(nn.Module):
             if self.model_args.PER_NODE_EMBED:
                 obs_embed = (obs[:, :, :, None] * self.limb_embed_weights[:, unimal_ids, :, :]).sum(dim=-2, keepdim=False) + self.limb_embed_bias[:, unimal_ids, :]
             else:
-                obs_embed = self.limb_embed(obs)
+                obs_embed = self.limb_embed(obs)    # [N, B, obs_dim52] -> [N, B, h_dim128]
         
         if self.model_args.EMBEDDING_SCALE:
             obs_embed *= math.sqrt(self.d_model)
@@ -341,7 +341,7 @@ class TransformerModel(nn.Module):
                 morphology_info=morphology_info
             )
         
-        decoder_input = obs_embed_t
+        decoder_input = obs_embed_t # [N, B, 128] as the dims of output and input of transformer model are the same
         if "hfield" in cfg.ENV.KEYS_TO_KEEP and self.ext_feat_fusion == "late":
             decoder_input = torch.cat([decoder_input, hfield_obs], axis=2)
 
@@ -440,10 +440,10 @@ class ActorCritic(nn.Module):
 
         if cfg.ENV_NAME == "Unimal-v0":
             if cfg.MODEL.TYPE == 'transformer':
-                self.mu_net = TransformerModel(obs_space, 2)
+                self.mu_net = TransformerModel(obs_space, 2)    # In Transformer, all nodes share the same action decoder
             else:
                 self.mu_net = MLPModel(obs_space, cfg.MODEL.MAX_LIMBS * 2)
-            self.num_actions = cfg.MODEL.MAX_LIMBS * 2
+            self.num_actions = cfg.MODEL.MAX_LIMBS * 2  # FT 12 * 2 = 24
         elif cfg.ENV_NAME == 'Modular-v0':
             if cfg.MODEL.TYPE == 'transformer':
                 self.mu_net = TransformerModel(obs_space, 1)
@@ -453,7 +453,7 @@ class ActorCritic(nn.Module):
         else:
             raise ValueError("Unsupported ENV_NAME")
 
-        if cfg.MODEL.ACTION_STD_FIXED:
+        if cfg.MODEL.ACTION_STD_FIXED:  # fix the standard variance to 1 and only optimize the mean of Gaussian Distribution
             log_std = np.log(cfg.MODEL.ACTION_STD)
             self.log_std = nn.Parameter(
                 log_std * torch.ones(1, self.num_actions), requires_grad=False,
@@ -469,7 +469,7 @@ class ActorCritic(nn.Module):
             batch_size = cfg.PPO.NUM_ENVS
 
         obs_env = {k: obs[k] for k in cfg.ENV.KEYS_TO_KEEP}
-        if "obs_padding_cm_mask" in obs:
+        if "obs_padding_cm_mask" in obs:    # False during collection
             obs_cm_mask = obs["obs_padding_cm_mask"]
         else:
             obs_cm_mask = None
@@ -498,7 +498,7 @@ class ActorCritic(nn.Module):
 
         # reshape the obs for transformer input
         if cfg.MODEL.TYPE == 'transformer':
-            obs = obs.reshape(batch_size, self.seq_len, -1).permute(1, 0, 2)
+            obs = obs.reshape(batch_size, self.seq_len, -1).permute(1, 0, 2)    # [B, 625] - > [B, N, 52] -> [N, B, 52] Why permutation? PyTorch Transformer batch_first=False
             obs_context = obs_context.reshape(batch_size, self.seq_len, -1).permute(1, 0, 2)
 
         # do not need to compute value function during evaluation to save time
@@ -513,11 +513,11 @@ class ActorCritic(nn.Module):
             limb_vals = limb_vals * (1 - obs_mask.int())
             # Use avg/max to keep the magnitidue same instead of sum
             num_limbs = self.seq_len - torch.sum(obs_mask.int(), dim=1, keepdim=True)
-            val = torch.divide(torch.sum(limb_vals, dim=1, keepdim=True), num_limbs)
+            val = torch.divide(torch.sum(limb_vals, dim=1, keepdim=True), num_limbs)    # [B, 1] All limbs share the same value
         else:
             val, v_attention_maps, dropout_mask_v = 0., None, 0.
 
-        mu, mu_attention_maps, dropout_mask_mu = self.mu_net(
+        mu, mu_attention_maps, dropout_mask_mu = self.mu_net(   # FT [B, N*2]
             obs, obs_mask, obs_env, obs_cm_mask, obs_context, morphology_info, 
             return_attention=return_attention, dropout_mask=dropout_mask_mu, 
             unimal_ids=unimal_ids, 
@@ -529,11 +529,11 @@ class ActorCritic(nn.Module):
             logp = pi.log_prob(act)
             logp[act_mask] = 0.0
             self.limb_logp = logp
-            logp = logp.sum(-1, keepdim=True)
+            logp = logp.sum(-1, keepdim=True)   # sum all the logp, corresponding to the sum value (classic multi-dim action)
             entropy = pi.entropy()
             entropy[act_mask] = 0.0
             entropy = entropy.mean()
-            return val, pi, logp, entropy, dropout_mask_v, dropout_mask_mu
+            return val, pi, logp, entropy, dropout_mask_v, dropout_mask_mu  # [B, 1], _, [B, N*2], [B, 1], 0.0, 0.0
         else:
             if return_attention:
                 return val, pi, v_attention_maps, mu_attention_maps, dropout_mask_v, dropout_mask_mu

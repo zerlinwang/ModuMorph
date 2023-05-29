@@ -79,8 +79,21 @@ class PPO:
         for key in obs:
             print (key, obs[key].size())
 
+        # FT
+        # proprioceptive torch.Size([32, 624])
+        # edges torch.Size([32, 32])
+        # context torch.Size([32, 420])
+        # connectivity torch.Size([32, 12, 12, 3])
+        # node_depth torch.Size([32, 12, 6])
+        # traversals torch.Size([32, 12, 3])
+        # node_path_length torch.Size([32, 12])
+        # node_path_mask torch.Size([32, 12, 12])
+        # SWAT_RE torch.Size([32, 12, 12, 3])
+        # obs_padding_mask torch.Size([32, 12])
+        # act_padding_mask torch.Size([32, 24])
+
         # hardcode log interval for single-task and multi-task training
-        if cfg.PPO.MAX_ITERS > 1000:
+        if cfg.PPO.MAX_ITERS > 1000:    # FT 1220
             self.stat_save_freq = 100
         else:
             self.stat_save_freq = 10
@@ -125,6 +138,8 @@ class PPO:
                 unimal_ids = self.envs.get_unimal_idx()
             else:
                 unimal_ids = [0 for _ in range(cfg.PPO.NUM_ENVS)]
+            # As the timeout is set by human rather than environment, so we need bootstrap value of next timestep
+            # Refer to the paper "Time Limits in Reinforcement Learning"
             next_val = self.agent.get_value(obs, unimal_ids=unimal_ids)
             self.buffer.compute_returns(next_val)
             self.train_on_batch(cur_iter)
@@ -157,7 +172,7 @@ class PPO:
         print("Finished Training: {}".format(self.file_prefix))
 
     def train_on_batch(self, cur_iter):
-        adv = self.buffer.ret - self.buffer.val
+        adv = self.buffer.ret - self.buffer.val # [TIMESTEPS, ENV_NUMS, 1]
         adv = (adv - adv.mean()) / (adv.std() + 1e-5)
 
         for i in range(cfg.PPO.EPOCHS):

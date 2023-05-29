@@ -568,6 +568,29 @@ _C.HI = CN()
 # Max length of history
 _C.HI.MAX_LENGTH = 16
 
+_C.HI.MORPH_CONTEXT_DIM = 128
+_C.HI.DYNAMIC_CONTEXT_DIM = 128
+
+# ----------------------------------------------------------------------------#
+# Temporal Transformer
+# ----------------------------------------------------------------------------#
+_C.TT = CN()
+
+# hidden dim
+_C.TT.HDIM = 128
+
+# Transformer block num
+_C.TT.NLAYERS = 2
+
+# Multi-head attention head num
+_C.TT.NHEAD = 2
+
+# Feedforward Layer output dim
+_C.TT.DIM_FEEDFORWARD = 1024
+
+# Dropout rate in Transformer
+_C.TT.DROPOUT = 0.
+
 
 def dump_cfg(cfg_name=None):
     """Dumps the config to the output directory."""

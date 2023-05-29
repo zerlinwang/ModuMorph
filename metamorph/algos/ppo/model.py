@@ -565,3 +565,127 @@ class Agent:
     def get_value(self, obs, dropout_mask_v=None, dropout_mask_mu=None, unimal_ids=None):
         val, _, _, _, _, _ = self.ac(obs, dropout_mask_v=dropout_mask_v, dropout_mask_mu=dropout_mask_mu, unimal_ids=unimal_ids)
         return val
+
+
+class TemporalTransformer(nn.Module):
+    """
+    Transformer to predict Morphology context and Dynamics context based on historial context emb and act
+    """
+
+    def __init__(self, context_emb_dim, act_dim) -> None:
+        super().__init__()
+        self.h_dim = cfg.TT.HDIM
+        self.context_len = cfg.HI.MAX_LENGTH
+        # embedding layer
+        self.timestep_embed = nn.Embedding(self.context_len, self.h_dim)
+        self.act_embed = nn.Linear(act_dim, self.h_dim)
+        self.obs_embed = nn.Linear(context_emb_dim, self.h_dim)
+        # transformer layer
+        blocks = TransformerEncoderLayerResidual(
+            self.h_dim,
+            cfg.TT.NHEAD,
+            cfg.TT.DIM_FEEDFORWARD,
+            cfg.TT.DROPOUT,
+            batch_first=True
+        )
+        self.transformer = TransformerEncoder(
+            blocks, cfg.TT.NLAYERS, norm=None
+        )
+        # context predictor
+        self.morph_predictor = nn.Linear(2 * self.context_len * self.h_dim, cfg.HI.MORPH_CONTEXT_DIM)
+        self.dynamic_predictor = nn.Linear(2 * self.context_len * self.h_dim, cfg.HI.DYNAMIC_CONTEXT_DIM)
+
+        self.register_buffer("timestep", torch.arange(self.context_len).unsqueeze(0))
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module) -> None:
+        """
+        Init weights of the network
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # module.weight.data.uniform_(math.sqrt(6.0/sum(module.weight.size())))
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+    def forward(self, hi_context_emb: torch.Tensor, hi_act: torch.Tensor, hi_masks: torch.Tensor):
+        """
+        Compute contexts based on history info
+        We don't care about the obs mask because all limbs share the same network
+        Input:
+            hi_context_emb: torch.Tensor (B, K, N, context_emb_dim)
+            hi_act: torch.Tensor (B, K, N, act_dim)
+            hi_masks: torch.Tensor (B, K, N, 1)
+        Return:
+            morph_context: torch.Tensor (N, B, morph_context_dim), context to be concatenated with obs embedding indicating the morphology
+            dynamic_context: torch.Tensor (N, B, dynamic_context_dim), context to be concatenated with decoder input indicating the dynamic of MDP
+        """
+        B, K, N = hi_context_emb.shape[:-1]
+        assert K == self.context_len, "K should be equal to context length"
+
+        # permute to fit with PyTorch Network settings
+        hi_context_emb = hi_context_emb.permute(2, 0, 1, 3)   # (N, B, K(length), context_emb_dim)
+        hi_act = hi_act.permute(2, 0, 1, 3)
+        hi_masks = hi_masks.permute(2, 0, 1, 3).reshape(N*B, K, 1).repeat(1, 1, 2).reshape(N*B, 2*K)    # 2*K because of two modalities
+
+        # embedding
+        timestep_embedding = self.timestep_embed(self.timestep) # -> (1, K, h_dim)
+        obs_embedding = self.obs_embed(hi_context_emb) + timestep_embedding   # -> (N, B, K, h_dim)
+        act_embedding = self.act_embed(hi_act) + timestep_embedding  # -> (N, B, K, h_dim)
+
+        # stack -> (N*B, 2*K, h_dim)
+        # (s_1,a_1,s_2,a_2,...,s_K,a_K)
+        h = torch.stack([obs_embedding, act_embedding], dim=2).permute(0, 1, 3, 2, 4).reshape(N*B, 2*K, self.h_dim)
+
+        # transformer
+        h = self.transformer(
+            h, src_key_padding_mask=hi_masks
+        )   # (N*B, 2*K, h_dim)
+
+        # context predict
+        h = h.reshape(N, B, -1)
+        morph_context = self.morph_predictor(h) # -> (N, B, morph_dim)
+        dynamic_context = self.dynamic_predictor(h) # -> (N, B, dynamic_dim)
+
+        return morph_context, dynamic_context
+    
+
+# for test
+if __name__ == "__main__":
+    from tools.train_ppo import parse_args
+    from pprint import pprint
+
+    # Parse cmd line args
+    args = parse_args()
+
+    # Load config options
+    cfg.merge_from_file(args.cfg_file)
+    cfg.merge_from_list(args.opts)
+
+    hi_context_emb, act_dim = 128, 2
+
+    # model initialization
+    tt = TemporalTransformer(hi_context_emb, act_dim)
+    pprint(tt)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+    tt.to(device)
+
+    # fake data manufication
+    B, K, N = 32, 16, 12
+    hi_context_emb = torch.randn((B, K, N, hi_context_emb)).cuda()
+    hi_act = torch.randn((B, K, N, act_dim)).cuda()
+    hi_masks = torch.randint(0, 2, (B, K, N, 1)).to(torch.bool).cuda()
+
+    # forward
+    morph_context, dynamic_context = tt(hi_context_emb, hi_act, hi_masks)
+
+    pprint(morph_context.shape)
+    pprint(dynamic_context.shape)

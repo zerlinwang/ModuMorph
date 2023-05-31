@@ -89,7 +89,7 @@ class TransformerModel(nn.Module):
 
         # Transformer Encoder
         encoder_layers = TransformerEncoderLayerResidual(
-            cfg.MODEL.LIMB_EMBED_SIZE * 2,  # 128 * 2 = 256
+            cfg.MODEL.LIMB_EMBED_SIZE,
             self.model_args.NHEAD,
             self.model_args.DIM_FEEDFORWARD,
             self.model_args.DROPOUT,
@@ -100,7 +100,7 @@ class TransformerModel(nn.Module):
         )
 
         # Map encoded observations to per node action mu or critic value
-        decoder_input_dim = self.d_model * 2
+        decoder_input_dim = self.d_model
 
         # Task based observation encoder
         if "hfield" in cfg.ENV.KEYS_TO_KEEP:
@@ -289,7 +289,7 @@ class TransformerModel(nn.Module):
                 obs_embed = self.limb_embed(obs)    # [N, B, obs_dim52] -> [N, B, h_dim128]
 
         # concate morph context
-        obs_embed = torch.cat([obs_embed, morph_context], axis=-1)
+        obs_embed = obs_embed + morph_context
         
         if self.model_args.EMBEDDING_SCALE:
             obs_embed *= math.sqrt(self.d_model)
@@ -352,7 +352,7 @@ class TransformerModel(nn.Module):
         encoded_feature = obs_embed_t.detach().clone().permute(1, 0, 2)
         
         decoder_input = obs_embed_t # [N, B, 128] as the dims of output and input of transformer model are the same
-        decoder_input = torch.cat([obs_embed_t, dynamic_context], dim=-1)
+        # decoder_input = torch.cat([obs_embed_t, dynamic_context], dim=-1)
         if "hfield" in cfg.ENV.KEYS_TO_KEEP and self.ext_feat_fusion == "late":
             decoder_input = torch.cat([decoder_input, hfield_obs], axis=2)
 
@@ -630,7 +630,7 @@ class TemporalTransformer(nn.Module):
         Input:
             hi_encoded_feature: torch.Tensor (B, K, N, encoded_feature_dim)
             hi_act: torch.Tensor (B, K, N, act_dim)
-            hi_masks: torch.Tensor (B, K, N, 1)
+            hi_masks: torch.Tensor (B, K, 1)
         Return:
             morph_context: torch.Tensor (N, B, morph_context_dim), context to be concatenated with obs embedding indicating the morphology
             dynamic_context: torch.Tensor (N, B, dynamic_context_dim), context to be concatenated with decoder input indicating the dynamic of MDP
@@ -639,9 +639,9 @@ class TemporalTransformer(nn.Module):
         assert K == self.context_len, "K should be equal to context length"
 
         # permute to fit with PyTorch Network settings
-        hi_encoded_feature = hi_encoded_feature.permute(2, 0, 1, 3)   # (N, B, K(length), encoded_feature_dim)
+        hi_encoded_feature = hi_encoded_feature.permute(2, 0, 1, 3)   # (N, B, K(length), 2*encoded_feature_dim)
         hi_act = hi_act.permute(2, 0, 1, 3)
-        hi_masks = hi_masks.permute(2, 0, 1, 3).reshape(N*B, K, 1).repeat(1, 1, 2).reshape(N*B, 2*K)    # 2*K because of two modalities
+        hi_masks = hi_masks.unsqueeze(-1).repeat(1, 1, N, 1).permute(2, 0, 1, 3).reshape(N*B, K, 1).repeat(1, 1, 2).reshape(N*B, 2*K)    # 2*K because of two modalities
 
         # embedding
         timestep_embedding = self.timestep_embed(self.timestep) # -> (1, K, h_dim)
@@ -677,10 +677,10 @@ if __name__ == "__main__":
     cfg.merge_from_file(args.cfg_file)
     cfg.merge_from_list(args.opts)
 
-    hi_encoded_feature, act_dim = 128, 2
+    hi_encoded_feature_dim, act_dim = 128, 2
 
     # model initialization
-    tt = TemporalTransformer(hi_encoded_feature, act_dim)
+    tt = TemporalTransformer(hi_encoded_feature_dim, act_dim)
     pprint(tt)
 
     if torch.cuda.is_available():
@@ -691,9 +691,9 @@ if __name__ == "__main__":
 
     # fake data manufication
     B, K, N = 32, 16, 12
-    hi_encoded_feature = torch.randn((B, K, N, hi_encoded_feature)).cuda()
+    hi_encoded_feature = torch.randn((B, K, N, hi_encoded_feature_dim)).cuda()
     hi_act = torch.randn((B, K, N, act_dim)).cuda()
-    hi_masks = torch.randint(0, 2, (B, K, N, 1)).to(torch.float).cuda()
+    hi_masks = torch.randint(0, 2, (B, K, 1)).to(torch.float).cuda()
 
     # forward
     morph_context, dynamic_context = tt(hi_encoded_feature, hi_act, hi_masks)

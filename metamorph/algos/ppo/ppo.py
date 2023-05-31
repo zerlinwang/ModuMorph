@@ -157,7 +157,7 @@ class PPO:
                 HI["hi_act"].pop(0)
                 HI["hi_act"].append(act)
                 HI["hi_masks"].pop(0)
-                HI["hi_masks"].append(torch.ones((T, P, 1), dtype=torch.float, device=self.device))
+                HI["hi_masks"].append(torch.ones((P, 1), dtype=torch.float, device=self.device))
 
                 for p, done_info in enumerate(last_done):
                     if done_info:
